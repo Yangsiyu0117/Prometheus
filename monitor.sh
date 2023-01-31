@@ -1,6 +1,6 @@
 #!/bin/bash
 # date : 2023.1.3
-# Use：Centos 7
+# Use：Centos 7 or openEuler
 # Install prometheus+grafana+alertmanager
 
 #骚气颜色
@@ -57,19 +57,27 @@ workdir=$(
 prometheus_package=prometheus-2.41.0.linux-amd64.tar.gz
 grafana_package=grafana-enterprise-9.3.2-1.x86_64.rpm
 alertmanager_packge=alertmanager-0.25.0-rc.2.linux-amd64.tar.gz
+node_exporter=node_exporter-1.5.0.linux-amd64.tar.gz
+webhook_dingtalk=prometheus-webhook-dingtalk-2.1.0.linux-amd64.tar.gz
 
 wget_software() {
 	yum -y install wget >&/dev/null
-	if [ ! -f ${prometheus_package} ]; then
+	if [ ! -f $workdir/${prometheus_package} ]; then
 		wget https://github.com/prometheus/prometheus/releases/download/v2.41.0/${prometheus_package} >&/dev/null
 	fi
-	if [ ! -f ${grafana_package} ]; then
+	if [ ! -f $workdir/${grafana_package} ]; then
 		wget https://dl.grafana.com/enterprise/release/${grafana_package} >&/dev/null
 	fi
-	if [ ! -f ${alertmanager_packge} ]; then
-		cd /root/
+	if [ ! -f $workdir/${alertmanager_packge} ]; then
 		wget https://github.com/prometheus/alertmanager/releases/download/v0.25.0-rc.2/${alertmanager_packge} >&/dev/null
 	fi
+	if [ ! -f $workdir/${node_exporter} ]; then
+		wget https://github.com/prometheus/node_exporter/releases/download/v1.5.0/${node_exporter} >&/dev/null
+	fi
+	if [ ! -f $workdir/${webhook_dingtalk} ]; then
+		wget https://github.com/timonwong/prometheus-webhook-dingtalk/releases/download/v2.1.0/${webhook_dingtalk} >&/dev/null
+	fi
+
 }
 
 ###
@@ -187,11 +195,138 @@ start_software() {
 	proc=alertmanager
 	write_header
 	run_ok
+	systemctl enable node_exporter.service >&/dev/null
+	systemctl start node_exporter.service >&/dev/null
+	proc=node_exporter
+	write_header
+	run_ok
+	systemctl enable prometheus-webhook-dingtalk.service >&/dev/null
+	systemctl start prometheus-webhook-dingtalk.service >&/dev/null
+	proc=prometheus-webhook-dingtalk
+	write_header
+	run_ok
 }
 
-# docker_install(){
+docker_install() {
+	yum -y install docker-ce docker-compose-plugin
+	docker_tar=docker_monitor.tar.gz
+	mkdir -p /home/prom/prometheus/data
+	mkdir -p /home/prom/grafana
+	mkdir /data
+	tar xf $workdir/$docker_tar -C /data/
+	docker compose -f /data/monitor/docker-compose.yml up -d
+	docker compose ps
+}
 
-# }
+install_node_exporter() {
+	tar xf $workdir/$node_exporter -C /usr/local/
+	ln -sv /usr/local/node_exporter-1.5.0.linux-amd64/ /usr/local/node_exporter >&/dev/null
+	chown -R prometheus.prometheus /usr/local/node_exporter
+	cat >>/usr/lib/systemd/system/node_exporter.service <<EOF
+[Unit]
+Description=Node Exporter
+
+[Service]
+ExecStart=/usr/local/node_exporter/node_exporter --web.listen-address=:9100  --collector.filesystem  --collector.netdev  --collector.cpu  --collector.diskstats  --collector.mdadm  --collector.loadavg  --collector.time  --collector.uname  --collector.logind
+
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	systemctl daemon-reload
+}
+
+install_webhool_dingtalk() {
+	mkdir -p /usr/local/prometheus/wehook/
+	tar -xf $workdir/$webhook_dingtalk -C /usr/local/prometheus/wehook/prometheus-webhook-dingtalk-2.1.0.linux-amd64
+	mv /usr/local/prometheus/wehook/prometheus-webhook-dingtalk-2.1.0.linux-amd64 /usr/local/prometheus/wehook/dingtalk
+	cat >>/usr/lib/systemd/system/prometheus-webhook-dingtalk.service <<EOF
+[Unit]
+Description=Alertmanager for prometheus
+
+[Service]
+Restart=always
+User=prometheus
+ExecStart=/usr/local/prometheus/wehook/dingtalkprometheus-webhook-dingtalk --config.file=/usr/local/prometheus/wehook/dingtalk/config.yml
+ExecReload=/bin/kill -HUP $MAINPID
+TimeoutStopSec=20s
+SendSIGKILL=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	systemctl daemon-reload
+}
+
+bak_configfile() {
+	cp /usr/local/prometheus/prometheus.yml /usr/local/prometheus/prometheus.yml.bak
+	cp /usr/local/alertmanager/alertmanager.yml /usr/local/alertmanager/alertmanager.yml.bak
+	cp /usr/local/prometheus/wehook/dingtalk/config.example.yml /usr/local/prometheus/wehook/dingtalk/config.yml
+	echo "" >/usr/local/prometheus/wehook/dingtalk/config.yml
+	mkdir -p /usr/local/prometheus/wehook/dingtalk/templates
+	mkdir -p /usr/local/prometheus/rules
+}
+
+configure_files() {
+	cat >>/usr/local/prometheus/prometheus.yml <<EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["127.0.0.1:9093"]
+
+rule_files:
+   - /usr/local/prometheus/rules/node.yaml
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+  - job_name: "node"
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+EOF
+	mkdir -p /usr/local/prometheus/rules/
+	cp $workdir/node.yaml /usr/local/prometheus/rules/
+	cat >>/usr/local/alertmanager/alertmanager.yml <<EOF
+global:
+  resolve_timeout: 30s
+
+route:
+  group_by: ['alertname']
+  group_wait: 60s
+  group_interval: 3m
+  receiver: 'dev'
+
+receivers:
+- name: 'dev'
+  webhook_configs:
+  - send_resolved: true
+    url: http://127.0.0.1:8060/dingtalk/dev/send
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'job', 'instance']
+EOF
+	cat >>/usr/local/prometheus/wehook/dingtalk/config.yml <<EOF
+targets:
+  dev:
+    url: https://oapi.dingtalk.com/robot/send?access_token=2e7a57d2731720053f60143741a1b806b3d4bc89ab142dfedd06947f8c572893
+    secret: SECdfaaa917475bc01443d237fb2299c917c2bdfdfc96dbd9596f1c853ca4ff8196
+    message:
+      title: '{{ template "ding.link.title" . }}'
+      text: '{{ template "ding.link.content" . }}'
+templates:
+  - /usr/local/prometheus/wehook/dingtalk/templates/default.tmpl
+EOF
+	cp %workdir/default.tmpl /usr/local/prometheus/wehook/dingtalk/templates/
+}
 
 remove() {
 	uninstall_date=$(date +"%Y-%m-%d-%H%M%S")
@@ -232,24 +367,45 @@ install)
 		}
 
 		do_sth() {
-			#运行的主程序
-			network
-			if [[ $? == 1 ]]; then
-				#statements
-				wget_software
-				Useradd
-				create_dir
-				install_prometheus
-				install_grafana
-				install_alertmanager
-			else
+			read -p "Plsease choose installation method（docker or normal）： " method
+			case word in
+			normal)
+				network
+				if [[ $? == 1 ]]; then
+					#statements
+					wget_software
+					Useradd
+					create_dir
+					install_prometheus
+					install_grafana
+					install_alertmanager
+					install_node_exporter
+					install_webhool_dingtalk
+				else
+					Useradd
+					create_dir
+					install_prometheus
+					install_grafana
+					install_alertmanager
+					install_node_exporter
+					install_webhool_dingtalk
+				fi
+				;;
+			docker)
+				network
+				if [[ $? == 1 ]]; then
+					docker_install
+				else
+					show_str_Red "--------------------------------------------"
+					show_str_Red "|                  警告！！！              |"
+					show_str_Red "|    检查到当前网络不可用，请选择normal安装     |"
+					show_str_Red "--------------------------------------------"
+					exit 0
+				fi
+				;;
 
-				Useradd
-				create_dir
-				install_prometheus
-				install_grafana
-				install_alertmanager
-			fi
+			esac
+			#运行的主程序
 
 		}
 
